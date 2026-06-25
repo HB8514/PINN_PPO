@@ -14,6 +14,13 @@ behaviors:
 
       physics_loss_strength: 0.0
 
+      physics_velocity_scale_mps: 11.111111
+      physics_yaw_rate_norm: 5.0
+      physics_wheel_base: 3.102
+      physics_max_steer_angle_deg: 45.0
+      physics_yaw_min_speed_mps: 1.0
+      physics_yaw_speed_temperature: 0.5
+
     network_settings:
       normalize: false
       hidden_units: 256

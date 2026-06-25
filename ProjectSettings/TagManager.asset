@@ -32,6 +32,8 @@ TagManager:
   - Checkpoint21
   - Checkpoint22
   - Checkpoint23
+  - RVCarCenter
+  - Checkpoint24
   layers:
   - Default
   - TransparentFX

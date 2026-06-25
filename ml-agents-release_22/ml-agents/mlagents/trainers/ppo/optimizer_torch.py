@@ -32,23 +32,26 @@ class PPOSettings(OnPolicyHyperparamSettings):
     beta_schedule: ScheduleType = ScheduleType.LINEAR
     epsilon_schedule: ScheduleType = ScheduleType.LINEAR
 
-    # =============================
-    # Physics loss coefficient
-    # =============================
-    # base PPO: 0.0
-    # PINN-PPO: 0.001, 0.01, 0.05 등으로 실험
+    # ===== Physics Loss =====
+    # 0.0 → baseline PPO (physics 비활성)
+    # 0.01 → yaw consistency 활성
     physics_loss_strength: float = 0.0
+
+    # ===== Vehicle Constants (Unity 실측) =====
+    # Prometeo maxSpeed=40 km/h → 40/3.6 m/s
+    physics_velocity_scale_mps: float = 40.0 / 3.6
+    physics_yaw_rate_norm: float = 5.0
+    physics_wheel_base: float = 3.102          # WheelCollider 실측
+    physics_max_steer_angle_deg: float = 45.0  # Inspector 확인
+
+    # ===== Yaw Consistency Hyperparameters =====
+    # 저속에서 kinematic 모델이 부정확 → speed gate로 약화
+    physics_yaw_min_speed_mps: float = 1.0    # gate 시작 속도
+    physics_yaw_speed_temperature: float = 0.5
 
 
 class TorchPPOOptimizer(TorchOptimizer):
     def __init__(self, policy: TorchPolicy, trainer_settings: TrainerSettings):
-        """
-        Takes a Policy and a Dict of trainer parameters and creates an Optimizer around the policy.
-        The PPO optimizer has a value estimator and a loss function.
-        :param policy: A TorchPolicy object that will be updated by this PPO Optimizer.
-        :param trainer_params: Trainer parameters dictionary that specifies the
-        properties of the trainer.
-        """
         super().__init__(policy, trainer_settings)
         reward_signal_configs = trainer_settings.reward_signals
         reward_signal_names = [key.value for key, _ in reward_signal_configs.items()]
@@ -94,51 +97,39 @@ class TorchPPOOptimizer(TorchOptimizer):
         self.stats_name_to_update_name = {
             "Losses/Value Loss": "value_loss",
             "Losses/Policy Loss": "policy_loss",
-            "Losses/Physics Loss": "physics_loss",
-            "Losses/Physics Friction Loss": "physics_friction_loss",
-            "Losses/Physics Steer Smoothness Loss": "physics_steer_rate_loss",
-            "Losses/Physics Throttle Smoothness Loss": "physics_throttle_rate_loss",
+            "Losses/Physics Yaw Loss": "physics_yaw_loss",
         }
 
         self.stream_names = list(self.reward_signals.keys())
-        self._debug_update_printed = False
+        self._debug_printed = False
 
     @property
     def critic(self):
         return self._critic
 
-    def _zero_physics_loss(self, current_obs):
+    def _zero(self, current_obs):
         if len(current_obs) > 0:
             return current_obs[0].sum() * 0.0
-
         return torch.tensor(0.0, device=default_device())
 
-    def _get_vector_observation(self, current_obs):
+    def _get_vector_obs(self, current_obs):
         """
-        Camera observation은 보통 4D tensor이고,
-        CarAgent.cs의 vector observation은 [batch, 5] 형태의 2D tensor임.
-        여기서는 5개 이상 들어있는 2D observation을 차량 상태 vector로 사용.
+        CarAgent.cs vector observation [batch, 5]:
+          obs[0] = forwardVelocity / velocityObservationScaleMps
+          obs[1] = lateralVelocity / velocityObservationScaleMps
+          obs[2] = yawRate / yawRateNorm
+          obs[3] = last raw steer command
+          obs[4] = last raw throttle command
         """
         for obs in current_obs:
             if obs.dim() == 2 and obs.shape[1] >= 5:
                 return obs
-
         return None
 
-    def _get_policy_deterministic_continuous_action(
-        self,
-        current_obs,
-        act_masks,
-        memories,
-    ):
-        """
-        현재 policy network가 현재 observation에서 내는 deterministic continuous action을 가져옴.
-        action[0] = steer
-        action[1] = throttle
-        """
+    def _get_deterministic_action(self, current_obs, act_masks, memories):
+        """현재 policy의 deterministic continuous action 반환."""
         if not hasattr(self.policy.actor, "network_body"):
             return None
-
         if not hasattr(self.policy.actor, "action_model"):
             return None
 
@@ -147,175 +138,93 @@ class TorchPPOOptimizer(TorchOptimizer):
             memories=memories,
             sequence_length=self.policy.sequence_length,
         )
-
         action_outputs = self.policy.actor.action_model.get_action_out(
-            actor_encoding,
-            act_masks,
+            actor_encoding, act_masks,
         )
+        # index 3 = deterministic continuous action
+        return action_outputs[3]
 
-        deterministic_continuous_action = action_outputs[3]
-
-        return deterministic_continuous_action
-
-    def _calculate_physics_loss(self, current_obs, act_masks, memories, loss_masks):
+    def _calculate_yaw_loss(self, current_obs, act_masks, memories, loss_masks):
         """
-        [최종 재설계 / 방식 B] 현재 관측 state(buffer 상수) + 현재 policy action
-        (미분가능)으로 즉각적 물리 타당성을 제약한다. gradient 경로:
-            theta -> pi(s_t) -> physics_loss -> grad theta
+        Quasi-static kinematic yaw consistency loss.
 
-        세 항 (옵션 A):
-          1. friction-circle : 코너에서 미끄러지지 않기.
-             종/횡 가속도 명령이 타이어 마찰 원 안에 있도록.
-             steer, throttle 두 action 모두에 gradient.
-          2. steering-rate   : 핸들 떨림 방지.
-             현재 steer가 직전 steer(obs[3]) 대비 급변하지 않도록. 항상 active.
-          3. throttle-rate   : throttle 떨림 방지.
-             현재 throttle이 직전 throttle(obs[4]) 대비 급변하지 않도록. 항상 active.
+        물리적 근거:
+          Decision Period=5, fixedDeltaTime=0.02s → 같은 action이 0.1s 유지.
+          그 구간에서 kinematic bicycle 모델의 quasi-static 조건:
+            r_obs ≈ (vx / L) × tan(δ_policy)
+          이를 self-consistency constraint로 사용.
 
-        kinematic bicycle의 yaw transition 항은 제거했다. 그 항은 action->다음상태
-        전이 관계라서 방식 B(현재상태 즉각 제약)와 시간축이 맞지 않기 때문이다.
+        gradient 경로:
+          θ → π(s_t) → steer_now → yaw_rate_pred → yaw_loss → ∇θ
+          (steer action으로만 gradient 흐름)
 
-        CarAgent.cs vector observation 순서:
-        obs[0] = forwardVelocity / velocityObservationScaleMps
-        obs[1] = lateralVelocity / velocityObservationScaleMps
-        obs[2] = yawRate / yawRateNorm
-        obs[3] = lastSteerAction      (직전 적용 steer)
-        obs[4] = lastThrottleAction   (직전 적용 throttle)
-
-        반환: (physics_loss, friction_loss, steer_rate_loss, throttle_rate_loss)
+        반환: yaw_loss (scalar)
         """
-        zero = self._zero_physics_loss(current_obs)
+        zero = self._zero(current_obs)
 
         if self.hyperparameters.physics_loss_strength <= 0.0:
-            return zero, zero, zero, zero
+            return zero
 
-        vector_obs = self._get_vector_observation(current_obs)
-
+        vector_obs = self._get_vector_obs(current_obs)
         if vector_obs is None:
-            return zero, zero, zero, zero
-
+            return zero
         if vector_obs.shape[1] < 5:
-            return zero, zero, zero, zero
+            return zero
 
-        deterministic_action = self._get_policy_deterministic_continuous_action(
-            current_obs,
-            act_masks,
-            memories,
+        det_action = self._get_deterministic_action(current_obs, act_masks, memories)
+        if det_action is None:
+            return zero
+        if det_action.shape[-1] < 1:
+            return zero
+
+        # 상수
+        vel_scale = max(float(self.hyperparameters.physics_velocity_scale_mps), 1e-6)
+        yaw_norm = max(float(self.hyperparameters.physics_yaw_rate_norm), 1e-6)
+        L = max(float(self.hyperparameters.physics_wheel_base), 1e-6)
+        max_steer_rad = float(self.hyperparameters.physics_max_steer_angle_deg) * math.pi / 180.0
+        v_min = float(self.hyperparameters.physics_yaw_min_speed_mps)
+        v_temp = max(float(self.hyperparameters.physics_yaw_speed_temperature), 1e-6)
+
+        # state (buffer 상수)
+        vx = vector_obs[:, 0] * vel_scale          # 전진 속도 (m/s)
+        yaw_obs = vector_obs[:, 2] * yaw_norm       # 관측 yaw rate (rad/s)
+
+        # policy action (미분가능)
+        steer_now = det_action[:, 0]
+        steer_angle = steer_now * max_steer_rad
+
+        # kinematic bicycle 예측 yaw rate
+        yaw_pred = (vx / L) * torch.tan(steer_angle)
+
+        # 정규화 잔차
+        yaw_residual = (yaw_obs - yaw_pred) / yaw_norm
+
+        # 저속 gate: vx < 1m/s에서 kinematic 모델 부정확 → 자연스럽게 약화
+        speed_gate = torch.sigmoid(
+            (torch.abs(vx) - v_min) / v_temp
         )
 
-        if deterministic_action is None:
-            return zero, zero, zero, zero
-
-        if deterministic_action.shape[-1] < 2:
-            return zero, zero, zero, zero
-
-        # ===== Unity / CarAgent와 맞춘 실측·식별 상수 =====
-        # Prometeo maxSpeed=40 km/h -> 40/3.6 m/s.
-        velocity_scale_mps = 40.0 / 3.6
-        wheel_base = 3.102
-        max_steer_angle_rad = 45.0 * math.pi / 180.0
-
-        # 종/횡 가속도 한계: mu_effective * g.
-        # mu_effective는 WheelCollider 실측 마찰계수가 아니라 보수적으로 설정한
-        # 가속도 한계(feasibility) 파라미터다 (논문 limitation).
-        # ax_limit != ay_limit으로 두면 엄밀히는 friction ellipse가 되지만,
-        # 현재는 동일 값으로 보수적 원(circle)을 사용한다.
-        mu_effective = 0.9
-        gravity = 9.81
-        ay_limit = max(mu_effective * gravity, 1e-6)
-        ax_limit = max(mu_effective * gravity, 1e-6)
-
-        # throttle -> 종가속도(m/s^2) 매핑 gain. throttle sweep으로 식별 필요.
-        # 주의: ax_limit과 분리해야 gain이 약분되지 않고 실제 의미를 갖는다.
-        # (예: ax_cmd/ax_limit = gain*throttle / (mu*g) -> gain이 살아있음)
-        throttle_accel_gain = 3.3
-
-        # friction utilization을 smooth hinge에 넣을 때의 temperature.
-        # 값이 작을수록 max(usage-1, 0)에 가까워져 마찰 원 안쪽 처벌이 사라진다.
-        friction_temperature = 0.05
-
-        # ===== 내부 가중치 (옵션 A: 항별 독립 lambda) =====
-        # 세 항의 스케일이 달라 그대로 더하면 rate 항이 friction을 압도할 수 있다.
-        # steer 떨림을 throttle 떨림보다 더 강하게 억제(핸들 안정 우선).
-        lambda_steer_rate = 0.1
-        lambda_throttle_rate = 0.05
-
-        # ===== state (buffer 상수) =====
-        forward_velocity = vector_obs[:, 0] * velocity_scale_mps  # vx (m/s)
-        last_steer = vector_obs[:, 3]      # 직전 steer action (상수, 기준점)
-        last_throttle = vector_obs[:, 4]   # 직전 throttle action (상수, 기준점)
-
-        # ===== 현재 policy action (미분가능) =====
-        # clamp하지 않는다: clamp 포화 구간에서 gradient가 0으로 죽기 때문.
-        steer_now = deterministic_action[:, 0]
-        throttle_now = deterministic_action[:, 1]
-        steer_angle = steer_now * max_steer_angle_rad
-
-        # ===== 1. combined-acceleration feasibility (friction circle) =====
-        # a_y = v^2/R, R = L/tan(d)  =>  a_y = (v^2/L) tan(d).  steer 연결.
-        ay_cmd = (forward_velocity ** 2 / wheel_base) * torch.tan(steer_angle)
-        # a_x = gain * throttle.  throttle 연결. (gain은 ax_limit과 분리되어 살아있음)
-        ax_cmd = throttle_accel_gain * throttle_now
-
-        # utilization: sqrt norm. <1 허용, =1 한계, >1 초과 로 직접 해석 가능.
-        # 제곱합을 그대로 쓰면 바깥에서 4제곱으로 폭발하므로 sqrt를 취한다.
-        friction_utilization = torch.sqrt(
-            (ax_cmd / ax_limit) ** 2
-            + (ay_cmd / ay_limit) ** 2
-            + 1e-8
+        # smooth_l1: L2보다 outlier에 robust
+        yaw_loss_each = speed_gate * torch.nn.functional.smooth_l1_loss(
+            yaw_residual,
+            torch.zeros_like(yaw_residual),
+            reduction="none",
         )
 
-        # smooth hinge ~ max(utilization - 1, 0). temperature가 작을수록
-        # 마찰 원 안쪽(util<1)에서는 거의 0, 경계 초과 시 부드럽게 증가.
-        # (기존 softplus(util-1)은 util=0에서도 ~0.098을 줘서 정지/저속을
-        #  부당하게 처벌 → 차가 출발을 꺼리는 원인이었음)
-        friction_excess = friction_temperature * torch.nn.functional.softplus(
-            (friction_utilization - 1.0) / friction_temperature
-        )
-        friction_loss_each = friction_excess ** 2
-
-        # ===== 2. steering command smoothness =====
-        # (steer_now - last_steer)^2. Δt로 나누지 않으므로 물리적 rate(rad/s)가
-        # 아니라 "명령 부드러움(command smoothness)" regularizer다. last_steer는
-        # obs[3]의 직전 raw steer command (CarAgent에서 raw 기준으로 통일).
-        steer_rate_loss_each = (steer_now - last_steer) ** 2
-
-        # ===== 3. throttle command smoothness =====
-        # 위와 동일하게 raw-to-raw smoothness. last_throttle은 obs[4]의 직전 raw
-        # throttle command. (raw_now - raw_last로 일관 → 방식 B 정합성)
-        throttle_rate_loss_each = (throttle_now - last_throttle) ** 2
-
-        # ===== masked mean =====
-        friction_loss = ModelUtils.masked_mean(friction_loss_each, loss_masks)
-        steer_rate_loss = ModelUtils.masked_mean(steer_rate_loss_each, loss_masks)
-        throttle_rate_loss = ModelUtils.masked_mean(throttle_rate_loss_each, loss_masks)
-
-        # ===== 합산 (항별 내부 가중치 적용) =====
-        physics_loss = (
-            friction_loss
-            + lambda_steer_rate * steer_rate_loss
-            + lambda_throttle_rate * throttle_rate_loss
-        )
-
-        return physics_loss, friction_loss, steer_rate_loss, throttle_rate_loss
+        return ModelUtils.masked_mean(yaw_loss_each, loss_masks)
 
     @timed
     def update(self, batch: AgentBuffer, num_sequences: int) -> Dict[str, float]:
-        """
-        Performs update on model.
-        :param batch: Batch of experiences.
-        :param num_sequences: Number of sequences to process.
-        :return: Results of update.
-        """
-        if not self._debug_update_printed:
-            print("CUSTOM PPO OPTIMIZER UPDATE RUNNING")
+        if not self._debug_printed:
+            print("CUSTOM PPO OPTIMIZER (YAW CONSISTENCY) RUNNING")
             print("optimizer_torch.py path:", __file__)
-            self._debug_update_printed = True
+            print(f"physics_loss_strength: {self.hyperparameters.physics_loss_strength}")
+            self._debug_printed = True
 
-        # Get decayed parameters
         decay_lr = self.decay_learning_rate.get_value(self.policy.get_current_step())
         decay_eps = self.decay_epsilon.get_value(self.policy.get_current_step())
         decay_bet = self.decay_beta.get_value(self.policy.get_current_step())
+
         returns = {}
         old_values = {}
         for name in self.reward_signals:
@@ -328,8 +237,6 @@ class TorchPPOOptimizer(TorchOptimizer):
 
         n_obs = len(self.policy.behavior_spec.observation_specs)
         current_obs = ObsUtil.from_buffer(batch, n_obs)
-
-        # Convert to tensors
         current_obs = [ModelUtils.list_to_tensor(obs) for obs in current_obs]
 
         act_masks = ModelUtils.list_to_tensor(batch[BufferKey.ACTION_MASK])
@@ -342,7 +249,6 @@ class TorchPPOOptimizer(TorchOptimizer):
         if len(memories) > 0:
             memories = torch.stack(memories).unsqueeze(0)
 
-        # Get value memories
         value_memories = [
             ModelUtils.list_to_tensor(batch[BufferKey.CRITIC_MEMORY][i])
             for i in range(
@@ -368,6 +274,7 @@ class TorchPPOOptimizer(TorchOptimizer):
             memories=value_memories,
             sequence_length=self.policy.sequence_length,
         )
+
         old_log_probs = ActionLogProbs.from_buffer(batch).flatten()
         log_probs = log_probs.flatten()
         loss_masks = ModelUtils.list_to_tensor(batch[BufferKey.MASKS], dtype=torch.bool)
@@ -383,38 +290,29 @@ class TorchPPOOptimizer(TorchOptimizer):
             decay_eps,
         )
 
-        physics_loss, friction_loss, steer_rate_loss, throttle_rate_loss = (
-            self._calculate_physics_loss(
-                current_obs=current_obs,
-                act_masks=act_masks,
-                memories=memories,
-                loss_masks=loss_masks,
-            )
+        yaw_loss = self._calculate_yaw_loss(
+            current_obs=current_obs,
+            act_masks=act_masks,
+            memories=memories,
+            loss_masks=loss_masks,
         )
 
         loss = (
             policy_loss
             + 0.5 * value_loss
             - decay_bet * ModelUtils.masked_mean(entropy, loss_masks)
-            + self.hyperparameters.physics_loss_strength * physics_loss
+            + self.hyperparameters.physics_loss_strength * yaw_loss
         )
 
-        # Set optimizer learning rate
         ModelUtils.update_learning_rate(self.optimizer, decay_lr)
         self.optimizer.zero_grad()
         loss.backward()
-
         self.optimizer.step()
 
         update_stats = {
-            # NOTE: abs() is not technically correct, but matches the behavior in TensorFlow.
-            # TODO: After PyTorch is default, change to something more correct.
             "Losses/Policy Loss": torch.abs(policy_loss).item(),
             "Losses/Value Loss": value_loss.item(),
-            "Losses/Physics Loss": physics_loss.item(),
-            "Losses/Physics Friction Loss": friction_loss.item(),
-            "Losses/Physics Steer Smoothness Loss": steer_rate_loss.item(),
-            "Losses/Physics Throttle Smoothness Loss": throttle_rate_loss.item(),
+            "Losses/Physics Yaw Loss": yaw_loss.item(),
             "Policy/Learning Rate": decay_lr,
             "Policy/Epsilon": decay_eps,
             "Policy/Beta": decay_bet,
@@ -423,7 +321,6 @@ class TorchPPOOptimizer(TorchOptimizer):
 
         return update_stats
 
-    # TODO move module update into TorchOptimizer for reward_provider
     def get_modules(self):
         modules = {
             "Optimizer:value_optimizer": self.optimizer,

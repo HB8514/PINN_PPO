@@ -22,11 +22,8 @@ public class CarAgent : Agent
     private float lastSteerAction = 0f;
     private float lastThrottleAction = 0f;
 
-    // 분석용: 실제 환경에 적용된 throttle(속도제한/브레이크 통과 후).
-    // Inspector에서 실시간으로 볼 수 있도록 [SerializeField]. throttle sweep 때 유용.
     [SerializeField] private float lastAppliedThrottleDebug = 0f;
 
-    // 0 나누기 방어 (Inspector에서 실수로 0을 입력했을 때 대비)
     private float VelocityScaleMps => Mathf.Max(velocityObservationScaleMps, 1e-3f);
     private float ReverseVelocityScaleMps => Mathf.Max(reverseVelocityObservationScaleMps, 1e-3f);
 
@@ -43,16 +40,19 @@ public class CarAgent : Agent
     public float fallPenalty = -1.0f;
 
     [Header("Line Rewards / Penalties")]
-    public float carCenterReward = 0.09f;
+    public float carCenterReward = 0.5f;
     public float sideLinePenalty = -1.0f;
-    public float centerLinePenalty = -0.3f;
+    public float centerLinePenalty = -1.0f;
+
+    // 역주행 방지: 도로에 RVCarCenter 태그 콜라이더를 깔아 역방향 진행 시 밟히게 함.
+    public float reverseDirectionPenalty = -1.0f;
 
     private HashSet<int> visitedCarCenters = new HashSet<int>();
 
     [Header("Checkpoint Order Reward")]
-    public int maxCheckpointIndex = 18;
-    public float checkpointReward = 1.0f;
-    public float lapReward = 6.0f;
+    public int maxCheckpointIndex = 24;
+    public float checkpointReward = 5.0f;
+    public float lapReward = 10.0f;
     public float wrongCheckpointPenalty = -5.0f;
 
     private int expectedCheckpointIndex = 1;
@@ -61,19 +61,29 @@ public class CarAgent : Agent
     private float lapStartTime = 0f;
 
     [Header("Cumulative Stat Settings")]
-    public int finalWindowStartStep = 450000;
-    public int finalTrainingStep = 500000;
+    // 5개 구간으로 나눠서 충돌 누적값을 기록한다.
+    // 각 구간 그래프는 "전체 누적값"을 그 구간에서만 그린다.
+    public int totalTrainingStep = 500000;
+    public int numWindows = 5;   // 0-100k, 100k-200k, ..., 400k-500k
+
+    // TensorBoard x축(trainer step) 환산용 나눗수.
+    // Take Actions Between Decisions=true이면 OnActionReceived가 매 FixedUpdate
+    // 호출되지만, 경험 수집(trainer step)은 Decision Period마다 1번이다.
+    // 에이전트 수는 분자/분모에서 약분되므로 나눠야 하는 값은 Decision Period.
+    // Inspector의 Decision Requester > Decision Period와 동일하게 설정할 것.
+    public int decisionPeriod = 5;
 
     private static int totalCenterLineHits = 0;
     private static int totalSideLineHits = 0;
     private static int totalLapCompleted = 0;
 
-    private static int finalWindowCenterLineHits = 0;
-    private static int finalWindowSideLineHits = 0;
+    // 전체 에이전트의 OnActionReceived 누적 호출 수(모든 차 공유, static).
+    private static int _totalActionCalls = 0;
 
-    // [FIX 2] 매 통계 호출마다 문자열을 새로 만들지 않도록 1회 계산 후 캐싱.
-    private string _centerLineHitWindowStat;
-    private string _sideLineHitWindowStat;
+    // 5개 구간 stat 이름 캐싱 (호출 시 GC 0).
+    private string[] _centerLineWindowStats;
+    private string[] _sideLineWindowStats;
+    private int _windowSizeStep;
 
     [Header("Debug")]
     public bool enableDebugLog = false;
@@ -84,9 +94,7 @@ public class CarAgent : Agent
         totalCenterLineHits = 0;
         totalSideLineHits = 0;
         totalLapCompleted = 0;
-
-        finalWindowCenterLineHits = 0;
-        finalWindowSideLineHits = 0;
+        _totalActionCalls = 0;
     }
 
     public override void Initialize()
@@ -97,15 +105,22 @@ public class CarAgent : Agent
         if (car != null)
         {
             rb = car.GetComponent<Rigidbody>();
-            // RL 제어 모드 활성화: Prometeo Update()의 키보드/터치 actuator 로직이
-            // agent가 넣은 토크를 덮어쓰지 않도록 차단.
             car.agentControlEnabled = true;
         }
 
-        // [FIX 2] suffix 및 stat 이름 문자열을 여기서 한 번만 생성.
-        string finalWindowSuffix = $"{finalWindowStartStep / 1000}k_{finalTrainingStep / 1000}k";
-        _centerLineHitWindowStat = $"Car/CenterLineHit_{finalWindowSuffix}";
-        _sideLineHitWindowStat = $"Car/SideLineHit_{finalWindowSuffix}";
+        int windows = Mathf.Max(numWindows, 1);
+        _windowSizeStep = Mathf.Max(totalTrainingStep / windows, 1);
+
+        _centerLineWindowStats = new string[windows];
+        _sideLineWindowStats = new string[windows];
+
+        for (int i = 0; i < windows; i++)
+        {
+            int startK = (i * _windowSizeStep) / 1000;
+            int endK = ((i + 1) * _windowSizeStep) / 1000;
+            _centerLineWindowStats[i] = $"Car/CenterLineHit_{startK}k_{endK}k";
+            _sideLineWindowStats[i] = $"Car/SideLineHit_{startK}k_{endK}k";
+        }
 
         RecordCumulativeStats();
     }
@@ -128,9 +143,6 @@ public class CarAgent : Agent
         rb.velocity = Vector3.zero;
         rb.angularVelocity = Vector3.zero;
 
-        // motor/brake/steer/throttleAxis/LastApplied*/DecelerateCar Invoke까지
-        // 한 번에 초기화. ThrottleOff+ResetSteeringAngle+RecoverTraction 조합은
-        // brake torque·LastApplied* 잔류 위험이 있어 교체함.
         car.ResetAgentActuators();
 
         idleSteps = 0;
@@ -147,18 +159,28 @@ public class CarAgent : Agent
         RecordCumulativeStats();
     }
 
-    private int GetCurrentAcademyStep()
+    private int GetCurrentTrainerStep()
     {
-        if (Academy.Instance == null)
-            return 0;
-
-        return Academy.Instance.StepCount;
+        // 전체 OnActionReceived 호출 수를 Decision Period로 나눠 trainer step에 맞춤.
+        // Take Actions Between Decisions=true면 매 FixedUpdate마다 호출되지만
+        // 경험 수집은 Decision Period마다 1번이라 그만큼 나눠야 함.
+        int divisor = Mathf.Max(decisionPeriod, 1);
+        return _totalActionCalls / divisor;
     }
 
-    private bool IsInFinalWindow()
+    private int GetCurrentWindowIndex()
     {
-        int step = GetCurrentAcademyStep();
-        return step >= finalWindowStartStep && step <= finalTrainingStep;
+        int step = GetCurrentTrainerStep();
+        if (_windowSizeStep <= 0)
+            return 0;
+
+        int idx = step / _windowSizeStep;
+
+        int lastIdx = (_centerLineWindowStats != null)
+            ? _centerLineWindowStats.Length - 1
+            : 0;
+
+        return Mathf.Clamp(idx, 0, lastIdx);
     }
 
     private void AddAverageStat(string statName, float value)
@@ -173,42 +195,34 @@ public class CarAgent : Agent
 
     private void RecordCumulativeStats()
     {
-        // [FIX 2] 캐싱된 문자열 재사용 → 호출 시 문자열 할당(GC) 0.
         AddMostRecentStat("Car/CenterLineHitTotal", totalCenterLineHits);
-        AddMostRecentStat(_centerLineHitWindowStat, finalWindowCenterLineHits);
-
         AddMostRecentStat("Car/SideLineHitTotal", totalSideLineHits);
-        AddMostRecentStat(_sideLineHitWindowStat, finalWindowSideLineHits);
-
         AddMostRecentStat("Car/LapCompletedTotal", totalLapCompleted);
+
+        if (_centerLineWindowStats == null || _sideLineWindowStats == null)
+            return;
+
+        int w = GetCurrentWindowIndex();
+        AddMostRecentStat(_centerLineWindowStats[w], totalCenterLineHits);
+        AddMostRecentStat(_sideLineWindowStats[w], totalSideLineHits);
     }
 
     private void RegisterCenterLineHit()
     {
         totalCenterLineHits++;
-
-        if (IsInFinalWindow())
-            finalWindowCenterLineHits++;
-
         RecordCumulativeStats();
     }
 
     private void RegisterSideLineHit()
     {
         totalSideLineHits++;
-
-        if (IsInFinalWindow())
-            finalWindowSideLineHits++;
-
         RecordCumulativeStats();
     }
 
     private void RegisterLapCompleted(float lapTime)
     {
         totalLapCompleted++;
-
         AddAverageStat("Car/LapTime", lapTime);
-
         RecordCumulativeStats();
     }
 
@@ -249,6 +263,9 @@ public class CarAgent : Agent
     {
         if (car == null || rb == null) return;
 
+        // 모든 에이전트 공유 카운터. trainer step 환산용(GetCurrentTrainerStep 참고).
+        _totalActionCalls++;
+
         float steer = Mathf.Clamp(actions.ContinuousActions[0], -1f, 1f);
         float throttle = Mathf.Clamp(actions.ContinuousActions[1], -1f, 1f);
 
@@ -256,15 +273,8 @@ public class CarAgent : Agent
 
         car.SetSteeringNormalized(steer);
 
-        // 연속 throttle: 데드존 없이 항상 비례 토크로 매핑.
-        // deadzone을 두면 작은 throttle을 버려 Python 물리식 입력(raw)과
-        // Unity 실제 입력이 어긋나므로 제거함. 정확히 0은 메서드 내부에서 처리.
         car.SetThrottleNormalized(throttle);
 
-        // physics loss(command smoothness)는 raw-to-raw 비교를 쓰므로 관측에는
-        // raw throttle command를 저장한다. (방식 B 정합성: Python의 throttle_now도
-        // raw policy action이므로 obs의 직전 throttle도 raw여야 의미가 맞음)
-        // 실제 적용값은 분석용으로 별도 보관(관측/loss에는 미사용).
         lastThrottleAction = throttle;
         lastAppliedThrottleDebug = car.LastAppliedThrottle;
 
@@ -308,28 +318,16 @@ public class CarAgent : Agent
             EndEpisodeWithLog("FellOffTrack");
             return;
         }
-
-        // [FIX 1] 매 스텝마다 호출되던 RecordCumulativeStats() 제거.
-        // 통계값은 충돌/랩 이벤트에서만 변하고, 해당 Register* 함수들이
-        // 내부에서 이미 RecordCumulativeStats()를 호출하므로 결과 동일.
     }
 
     private void OnCollisionEnter(Collision collision)
     {
+        // SideLine은 Non-Trigger이므로 여기(OnCollisionEnter)에서만 처리.
         if (collision.collider.CompareTag("SideLine"))
         {
             RegisterSideLineHit();
-
             AddReward(sideLinePenalty);
             EndEpisodeWithLog("SideLineCollision");
-            return;
-        }
-
-        if (collision.collider.CompareTag("CenterLine"))
-        {
-            RegisterCenterLineHit();
-
-            AddReward(centerLinePenalty);
             return;
         }
     }
@@ -341,20 +339,16 @@ public class CarAgent : Agent
             RewardCarCenterOnce(other);
         }
 
+        // 역주행 방지: RVCarCenter 밟으면 감점(에피소드 종료 없음).
+        if (other.CompareTag("RVCarCenter"))
+        {
+            AddReward(reverseDirectionPenalty);
+        }
+
         if (other.CompareTag("CenterLine"))
         {
             RegisterCenterLineHit();
-
             AddReward(centerLinePenalty);
-        }
-
-        if (other.CompareTag("SideLine"))
-        {
-            RegisterSideLineHit();
-
-            AddReward(sideLinePenalty);
-            EndEpisodeWithLog("SideLineTrigger");
-            return;
         }
 
         int checkpointNumber = GetCheckpointNumberFromTag(other);
@@ -385,7 +379,6 @@ public class CarAgent : Agent
                 lapStartTime = Time.time;
 
                 AddReward(lapReward);
-
                 RegisterLapCompleted(lapTime);
 
                 if (enableDebugLog)
@@ -413,7 +406,6 @@ public class CarAgent : Agent
             );
         }
 
-        // [FIX 3-b] 디버그 OFF일 때도 항상 문자열 보간이 일어나던 것을 분기 처리.
         if (enableDebugLog)
             EndEpisodeWithLog($"WrongCheckpoint Expected={expectedCheckpointIndex} Got={checkpointNumber}");
         else
@@ -435,10 +427,6 @@ public class CarAgent : Agent
 
     private int GetCheckpointNumberFromTag(Collider other)
     {
-        // [FIX 3] Substring 할당 제거 + Ordinal 비교로 문화권 처리 오버헤드 제거.
-        // 주의: other.tag getter 자체가 문자열 1개를 할당함(Unity 특성). 이 부분까지
-        // 완전 무할당으로 만들려면 체크포인트 콜라이더에 int 인덱스를 들고 있는
-        // 컴포넌트를 붙여 GetComponent로 읽는 방식이 정석(씬 수정 필요).
         string tagName = other.tag;
         const string prefix = "Checkpoint";
 

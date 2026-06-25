@@ -707,11 +707,11 @@ MonoBehaviour:
   fallPenalty: -1
   carCenterReward: 0.09
   sideLinePenalty: -1
-  centerLinePenalty: -0.3
-  maxCheckpointIndex: 21
-  checkpointReward: 1
-  lapReward: 2
-  wrongCheckpointPenalty: -0.2
+  centerLinePenalty: -1
+  maxCheckpointIndex: 18
+  checkpointReward: 5
+  lapReward: 20
+  wrongCheckpointPenalty: -5
   finalWindowStartStep: 450000
   finalTrainingStep: 500000
   enableDebugLog: 0
