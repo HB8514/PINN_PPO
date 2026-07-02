@@ -63,8 +63,8 @@ public class CarAgent : Agent
     [Header("Cumulative Stat Settings")]
     // 5개 구간으로 나눠서 충돌 누적값을 기록한다.
     // 각 구간 그래프는 "전체 누적값"을 그 구간에서만 그린다.
-    public int totalTrainingStep = 500000;
-    public int numWindows = 5;   // 0-100k, 100k-200k, ..., 400k-500k
+    public int totalTrainingStep = 100000;
+    public int numWindows = 1;   // 0-100k, 100k-200k, ..., 400k-500k
 
     // TensorBoard x축(trainer step) 환산용 나눗수.
     // Take Actions Between Decisions=true이면 OnActionReceived가 매 FixedUpdate
@@ -278,8 +278,9 @@ public class CarAgent : Agent
         lastThrottleAction = throttle;
         lastAppliedThrottleDebug = car.LastAppliedThrottle;
 
-        float forwardSpeed = Vector3.Dot(rb.velocity, car.transform.forward);
         float speedMag = rb.velocity.magnitude;
+
+        float forwardSpeed = Vector3.Dot(rb.velocity, car.transform.forward);
 
         AddReward(timePenalty);
 

@@ -1,4 +1,4 @@
-from typing import Dict, cast
+from typing import Dict, cast, Optional
 import math
 import attr
 
@@ -49,6 +49,17 @@ class PPOSettings(OnPolicyHyperparamSettings):
     physics_yaw_min_speed_mps: float = 1.0    # gate 시작 속도
     physics_yaw_speed_temperature: float = 0.5
 
+    # ===== Understeer 보정 (고속 yaw 과대예측 교정) =====
+    # yaml에서 반드시 명시할 것:
+    #   physics_understeer_k: 0.0    → 기존 무슬립 kinematic yaw residual
+    #   physics_understeer_k: 0.003  → 약한 understeer 보정 후보
+    #   physics_understeer_k: 0.01   → 중간 understeer 보정 후보
+    #   physics_understeer_k: 0.02   → 강한 understeer 보정 후보
+    #
+    # None은 "yaml에 값이 없음"을 의미한다. physics_loss_strength > 0인데
+    # 이 값이 None이면 __init__에서 에러를 내서 실험값 누락을 막는다.
+    physics_understeer_k: Optional[float] = None
+
 
 class TorchPPOOptimizer(TorchOptimizer):
     def __init__(self, policy: TorchPolicy, trainer_settings: TrainerSettings):
@@ -59,6 +70,16 @@ class TorchPPOOptimizer(TorchOptimizer):
         self.hyperparameters: PPOSettings = cast(
             PPOSettings, trainer_settings.hyperparameters
         )
+
+        if (
+            self.hyperparameters.physics_loss_strength > 0.0
+            and self.hyperparameters.physics_understeer_k is None
+        ):
+            raise ValueError(
+                "physics_understeer_k is missing in yaml. "
+                "Set physics_understeer_k: 0.0 for the original kinematic PI-PPO, "
+                "or a positive value such as 0.003 / 0.01 / 0.02 for understeer PI-PPO."
+            )
 
         params = list(self.policy.actor.parameters())
         if self.hyperparameters.shared_critic:
@@ -102,6 +123,7 @@ class TorchPPOOptimizer(TorchOptimizer):
 
         self.stream_names = list(self.reward_signals.keys())
         self._debug_printed = False
+        self._obs_diagnostic_printed = False
 
     @property
     def critic(self):
@@ -184,6 +206,9 @@ class TorchPPOOptimizer(TorchOptimizer):
         max_steer_rad = float(self.hyperparameters.physics_max_steer_angle_deg) * math.pi / 180.0
         v_min = float(self.hyperparameters.physics_yaw_min_speed_mps)
         v_temp = max(float(self.hyperparameters.physics_yaw_speed_temperature), 1e-6)
+        # physics_loss_strength > 0이면 __init__에서 None을 이미 차단한다.
+        # baseline PPO(physics_loss_strength <= 0)에서는 이 함수가 앞에서 zero를 반환한다.
+        understeer_k = max(float(self.hyperparameters.physics_understeer_k), 0.0)
 
         # state (buffer 상수)
         vx = vector_obs[:, 0] * vel_scale          # 전진 속도 (m/s)
@@ -194,7 +219,14 @@ class TorchPPOOptimizer(TorchOptimizer):
         steer_angle = steer_now * max_steer_rad
 
         # kinematic bicycle 예측 yaw rate
-        yaw_pred = (vx / L) * torch.tan(steer_angle)
+        #   무슬립: yaw = (vx / L) * tan(δ)
+        # understeer 보정 (K>0):
+        #   yaw = ((vx / L) * tan(δ)) / (1 + K * vx²)
+        #   고속에서 실제보다 회전을 과대예측하는 문제를 정상상태 요레이트로 교정.
+        #   K=0 이면 기존 무슬립 식과 동일 (하위호환).
+        yaw_pred_kinematic = (vx / L) * torch.tan(steer_angle)
+        understeer_denom = 1.0 + understeer_k * vx * vx
+        yaw_pred = yaw_pred_kinematic / understeer_denom
 
         # 정규화 잔차
         yaw_residual = (yaw_obs - yaw_pred) / yaw_norm
@@ -219,6 +251,7 @@ class TorchPPOOptimizer(TorchOptimizer):
             print("CUSTOM PPO OPTIMIZER (YAW CONSISTENCY) RUNNING")
             print("optimizer_torch.py path:", __file__)
             print(f"physics_loss_strength: {self.hyperparameters.physics_loss_strength}")
+            print(f"physics_understeer_k: {self.hyperparameters.physics_understeer_k}")
             self._debug_printed = True
 
         decay_lr = self.decay_learning_rate.get_value(self.policy.get_current_step())
@@ -238,6 +271,28 @@ class TorchPPOOptimizer(TorchOptimizer):
         n_obs = len(self.policy.behavior_spec.observation_specs)
         current_obs = ObsUtil.from_buffer(batch, n_obs)
         current_obs = [ModelUtils.list_to_tensor(obs) for obs in current_obs]
+
+        # ===== 관측(observation) 진단: 카메라 입력 여부 확정 =====
+        if not self._obs_diagnostic_printed:
+            print("=" * 60)
+            print("[OBS DIAGNOSTIC] 관측 개수(n_obs):", n_obs)
+            for i, obs in enumerate(current_obs):
+                print(f"  current_obs[{i}] shape = {tuple(obs.shape)}  (dim={obs.dim()})")
+            try:
+                specs = self.policy.behavior_spec.observation_specs
+                print("[OBS DIAGNOSTIC] behavior_spec observation_specs:")
+                for i, sp in enumerate(specs):
+                    name = getattr(sp, "name", f"obs{i}")
+                    shape = getattr(sp, "shape", None)
+                    print(f"  spec[{i}] name='{name}' shape={shape}")
+            except Exception as e:
+                print("[OBS DIAGNOSTIC] specs 출력 실패:", e)
+            has_image = any(o.dim() >= 4 for o in current_obs)
+            print("[OBS DIAGNOSTIC] 이미지(4D) 관측 존재?:", has_image,
+                  "->", "카메라 입력 사용 중" if has_image else "벡터 관측만(카메라 미사용)")
+            print("=" * 60)
+            self._obs_diagnostic_printed = True
+        # ========================================================
 
         act_masks = ModelUtils.list_to_tensor(batch[BufferKey.ACTION_MASK])
         actions = AgentAction.from_buffer(batch)
@@ -317,6 +372,11 @@ class TorchPPOOptimizer(TorchOptimizer):
             "Policy/Epsilon": decay_eps,
             "Policy/Beta": decay_bet,
             "Policy/Physics Loss Strength": self.hyperparameters.physics_loss_strength,
+            "Policy/Physics Understeer K": (
+                0.0
+                if self.hyperparameters.physics_understeer_k is None
+                else float(self.hyperparameters.physics_understeer_k)
+            ),
         }
 
         return update_stats

@@ -12,12 +12,13 @@ behaviors:
       num_epoch: 3
       learning_rate_schedule: linear
 
-      physics_loss_strength: 0.003
+      physics_loss_strength: 0.005
 
       physics_velocity_scale_mps: 11.111111
       physics_yaw_rate_norm: 5.0
       physics_wheel_base: 3.102
       physics_max_steer_angle_deg: 45.0
+      physics_understeer_k: 0.003
       physics_yaw_min_speed_mps: 1.0
       physics_yaw_speed_temperature: 0.5
 
@@ -25,7 +26,6 @@ behaviors:
       normalize: false
       hidden_units: 256
       num_layers: 2
-      vis_encode_type: simple
 
     reward_signals:
       extrinsic:
@@ -34,4 +34,4 @@ behaviors:
 
     max_steps: 500000
     time_horizon: 64
-    summary_freq: 10000
+    summary_freq: 5000

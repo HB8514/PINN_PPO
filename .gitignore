@@ -30,5 +30,9 @@ ExportedObj/
 # Asset Store Tools
 Assets/AssetStoreTools*
 
+# Results
+results/
+
+SlipLogs/
 
 echo **/*.demo >> .gitignore

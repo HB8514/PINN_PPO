@@ -25,7 +25,6 @@ behaviors:
       normalize: false
       hidden_units: 256
       num_layers: 2
-      vis_encode_type: simple
 
     reward_signals:
       extrinsic:
@@ -34,4 +33,4 @@ behaviors:
 
     max_steps: 500000
     time_horizon: 64
-    summary_freq: 10000
+    summary_freq: 5000
